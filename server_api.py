@@ -1,4 +1,5 @@
 import os, json
+from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -59,6 +60,14 @@ class BulkReq(BaseModel):
     model: str = "gpt-4.1-mini"
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/health")
 def health():
