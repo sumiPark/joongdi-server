@@ -1,10 +1,14 @@
-import os, json
-from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from openai import OpenAI
 import uvicorn
+
+import os
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from supabase import create_client, Client
+
 
 BASE_DIR = Path(__file__).resolve().parent
 API_KEY_FILE = BASE_DIR / "api_key.txt"
@@ -48,6 +52,7 @@ def call_openai(model: str, prompt: str):
     return res.output_text
 
 class SingleReq(BaseModel):
+    work_title: str = ""
     keyword: str
     style: str = "신뢰형"
     purpose: str = "후기형"
@@ -55,9 +60,58 @@ class SingleReq(BaseModel):
     model: str = "gpt-4.1-mini"
 
 class BulkReq(BaseModel):
+    work_title: str = ""
     keyword: str
     count: int = 3
     model: str = "gpt-4.1-mini"
+
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
+SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+
+supabase_public: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+def extract_bearer_token(authorization: Optional[str]) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    return authorization.replace("Bearer ", "", 1).strip()
+
+
+def get_current_user_profile(authorization: Optional[str] = Header(None)):
+    token = extract_bearer_token(authorization)
+
+    user_resp = supabase_public.auth.get_user(token)
+    user = user_resp.user
+    if not user:
+        raise HTTPException(status_code=401, detail="유효하지 않은 로그인입니다.")
+
+    profile_resp = (
+        supabase_admin.table("profiles")
+        .select("*")
+        .eq("id", user.id)
+        .single()
+        .execute()
+    )
+
+    profile = profile_resp.data
+    if not profile:
+        raise HTTPException(status_code=403, detail="프로필이 없습니다.")
+
+    return profile
+
+
+def require_approved_user(profile=Depends(get_current_user_profile)):
+    if profile["status"] != "approved":
+        raise HTTPException(status_code=403, detail="승인된 회원만 사용할 수 있습니다.")
+    return profile
+
+
+def require_admin(profile=Depends(get_current_user_profile)):
+    if profile["role"] != "admin":
+        raise HTTPException(status_code=403, detail="관리자만 접근할 수 있습니다.")
+    return profile
+
 
 app = FastAPI()
 
@@ -74,7 +128,7 @@ def health():
     return {"ok": True, "api_key_loaded": bool(read_api_key())}
 
 @app.post("/generate-single")
-def generate_single(req: SingleReq):
+def generate_single(req: SingleReq, profile=Depends(require_approved_user)):
     product = find_product(req.keyword)
     product_json = json.dumps(product, ensure_ascii=False, indent=2) if product else "매칭된 상품 데이터 없음"
     prompt = f"""
@@ -100,12 +154,28 @@ def generate_single(req: SingleReq):
 [썸네일 문구]
 """
     try:
-        return {"result": call_openai(req.model, prompt)}
+        result = call_openai(req.model, prompt)
+
+        supabase_admin.table("generation_history").insert({
+            "user_id": profile["id"],
+            "kind": "content",
+            "work_title": getattr(req, "work_title", "") or "",
+            "keyword": req.keyword,
+            "meta": {
+                "style": req.style,
+                "purpose": req.purpose,
+                "length": req.length
+            },
+            "result": result
+        }).execute()
+
+        return {"result": result}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/generate-bulk")
-def generate_bulk(req: BulkReq):
+def generate_bulk(req: BulkReq, profile=Depends(require_approved_user)):
     if req.count < 1 or req.count > 10:
         raise HTTPException(status_code=400, detail="count는 1 이상 10 이하만 허용합니다.")
     product = find_product(req.keyword)
@@ -149,9 +219,72 @@ def generate_bulk(req: BulkReq):
 추천 이유:
 """
     try:
-        return {"result": call_openai(req.model, prompt)}
+        result = call_openai(req.model, prompt)
+
+        supabase_admin.table("generation_history").insert({
+            "user_id": profile["id"],
+            "kind": "ideas",
+            "work_title": req.work_title or "",
+            "keyword": req.keyword,
+            "meta": {
+                "count": req.count
+            },
+            "result": result
+        }).execute()
+
+        return {"result": result}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run("server_api:app", host="0.0.0.0", port=8000, reload=False)
+
+
+@app.get("/admin/pending-users")
+def list_pending_users(admin=Depends(require_admin)):
+    resp = (
+        supabase_admin.table("profiles")
+        .select("*")
+        .eq("status", "pending")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return {"items": resp.data}
+
+
+@app.post("/admin/users/{user_id}/approve")
+def approve_user(user_id: str, admin=Depends(require_admin)):
+    resp = (
+        supabase_admin.table("profiles")
+        .update({
+            "status": "approved",
+            "approved_by": admin["id"],
+            "approved_at": "now()"
+        })
+        .eq("id", user_id)
+        .execute()
+    )
+    return {"ok": True, "data": resp.data}
+
+
+@app.post("/admin/users/{user_id}/reject")
+def reject_user(user_id: str, admin=Depends(require_admin)):
+    resp = (
+        supabase_admin.table("profiles")
+        .update({"status": "rejected"})
+        .eq("id", user_id)
+        .execute()
+    )
+    return {"ok": True, "data": resp.data}
+
+
+@app.post("/admin/users/{user_id}/suspend")
+def suspend_user(user_id: str, admin=Depends(require_admin)):
+    resp = (
+        supabase_admin.table("profiles")
+        .update({"status": "suspended"})
+        .eq("id", user_id)
+        .execute()
+    )
+    return {"ok": True, "data": resp.data}
